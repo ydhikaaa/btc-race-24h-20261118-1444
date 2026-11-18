@@ -8,12 +8,14 @@
 // the bars seen so far: no clock, no randomness, no environment reads.
 //
 // Entry (flat only, at most one open position, full size):
-//   DIP  — close >= 50 bps below the 60-bar EMA of closes AND the 5-bar
+//   DIP  — close >= 50 bps below the 60-bar EMA of closes AND the 3-bar
 //          return is positive (the dip has stopped falling).
 //   MOMO — 30-bar return >= 100 bps AND close above the 60-bar EMA.
 // Exit (in position):
-//   DIP  — close back at/above the EMA, or +90 bps, or -60 bps, or 120 bars.
-//   MOMO — close back below the EMA, or +120 bps, or -60 bps, or 120 bars.
+//   DIP  — close back at/above the EMA, or +120 bps, or -60 bps, or 120 bars,
+//          or a 40 bps giveback after a +60 bps peak (trailing exit).
+//   MOMO — close back below the EMA, or +120 bps, or -60 bps, or 120 bars,
+//          or the same trailing exit.
 // No new buys after 1410 scored bars: a trade opened later would be
 // flattened at the window's last close with no room to recover its costs.
 //
@@ -28,12 +30,14 @@ const SYMBOL = 'CBBTC';
 // Strategy parameters (basis points unless noted).
 const EMA_BARS = 60;
 const DIP_BPS = 50;
-const STAB_BARS = 5;
+const STAB_BARS = 3;
 const MOMO_BARS = 30;
 const MOMO_BPS = 100;
-const DIP_TAKE_BPS = 90;
+const DIP_TAKE_BPS = 120;
 const MOMO_TAKE_BPS = 120;
 const STOP_BPS = 60;
+const TRAIL_ARM_BPS = 60;
+const TRAIL_GIVEBACK_BPS = 40;
 const MAX_HOLD_BARS = 120;
 const LAST_BUY_BAR = 1410;
 const BUY_SLIPPAGE_BPS = 200;
@@ -45,6 +49,7 @@ interface OpenTrade {
   mode: Mode;
   entryPrice: number; // raw price units (price_scale 5), from the fill
   holdBars: number;
+  peakGainBps: number; // best gain since entry, for the trailing exit
 }
 
 const closes: number[] = [];
@@ -65,7 +70,7 @@ await runBars({
       for (const fill of batch.fills) {
         if (fill.client_id === pendingBuyId) {
           if (fill.status === 'filled' && pendingBuyMode !== null) {
-            openTrade = { mode: pendingBuyMode, entryPrice: Number(fill.price), holdBars: 0 };
+            openTrade = { mode: pendingBuyMode, entryPrice: Number(fill.price), holdBars: 0, peakGainBps: 0 };
           }
           pendingBuyId = null;
           pendingBuyMode = null;
@@ -90,12 +95,15 @@ await runBars({
     // gets managed from the account state.
     const held = state.positions.get(SYMBOL);
     if (openTrade === null && held !== undefined && held.qty > 0n) {
-      openTrade = { mode: 'dip', entryPrice: Number(state.close(SYMBOL) ?? close), holdBars: 0 };
+      openTrade = { mode: 'dip', entryPrice: Number(state.close(SYMBOL) ?? close), holdBars: 0, peakGainBps: 0 };
     }
     if (openTrade !== null && (held === undefined || held.qty === 0n)) {
       openTrade = null;
     }
-    if (openTrade !== null) openTrade.holdBars += 1;
+    if (openTrade !== null) {
+      openTrade.holdBars += 1;
+      openTrade.peakGainBps = Math.max(openTrade.peakGainBps, bpsChange(openTrade.entryPrice, close));
+    }
 
     if (state.warmingUp) return [];
     if (closes.length < EMA_BARS + STAB_BARS) return [];
@@ -107,7 +115,11 @@ await runBars({
       const recovered = openTrade.mode === 'dip' ? close >= ema : close < ema;
       const takeBps = openTrade.mode === 'dip' ? DIP_TAKE_BPS : MOMO_TAKE_BPS;
       const timedOut = openTrade.holdBars >= MAX_HOLD_BARS;
-      if (recovered || gainBps >= takeBps || gainBps <= -STOP_BPS || timedOut) {
+      // Trailing exit: once the trade has run up, bank it if it gives
+      // back a chunk of the peak instead of riding it down to the stop.
+      const trailedOff =
+        openTrade.peakGainBps >= TRAIL_ARM_BPS && gainBps <= openTrade.peakGainBps - TRAIL_GIVEBACK_BPS;
+      if (recovered || gainBps >= takeBps || gainBps <= -STOP_BPS || timedOut || trailedOff) {
         return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: SELL_SLIPPAGE_BPS }];
       }
       return [];
